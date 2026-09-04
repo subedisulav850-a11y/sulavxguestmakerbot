@@ -146,7 +146,6 @@ def register_account(password, region="BD"):
     payload_json = {"app_id": 100067, "client_type": 2, "password": password, "source": 2}
     payload = json.dumps(payload_json, separators=(',', ':'))
     signature = hmac.new(API_KEY, payload.encode(), hashlib.sha256).hexdigest()
-    timestamp = str(int(time.time() * 1000) + random.randint(-999, 999))
     headers = {
         "User-Agent": "GarenaMSDK/4.0.42(NX809J ;Android 9;en;US;app 1.130.1 2019121038;)",
         "Authorization": f"Signature {signature}",
@@ -154,14 +153,15 @@ def register_account(password, region="BD"):
         "Accept": "application/json",
         "Connection": "Keep-Alive",
         "Host": "100067.connect.garena.com",
-        "X-Garena-Timestamp": timestamp,
         "X-Forwarded-For": client_ip,
         "X-Real-IP": client_ip,
     }
     response = requests.post(url, headers=headers, data=payload, verify=False)
     json_data = response.json()
-    uid = json_data["data"]["uid"]
-    return uid, password
+    if "data" in json_data and "uid" in json_data["data"]:
+        uid = json_data["data"]["uid"]
+        return uid, password
+    raise Exception(f"Reg failed: {json_data}")
 
 def get_access_token(uid, password, region="BD"):
     url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
@@ -185,15 +185,13 @@ def get_access_token(uid, password, region="BD"):
     }
     payload = json.dumps(payload_json, separators=(',', ':'))
     response = requests.post(url, headers=headers, data=payload, verify=False)
-    if response.status_code != 200:
-        return None, None, None
     json_data = response.json()
-    if "data" not in json_data or "access_token" not in json_data["data"]:
-        return None, None, None
-    access_token = json_data["data"]["access_token"]
-    open_id = json_data["data"]["open_id"]
-    platform_type = 2
-    return access_token, open_id, platform_type
+    if "data" in json_data and "access_token" in json_data["data"]:
+        access_token = json_data["data"]["access_token"]
+        open_id = json_data["data"]["open_id"]
+        platform_type = 2
+        return access_token, open_id, platform_type
+    return None, None, None
 
 def major_register(access_token, open_id, name, LANG='en', region="BD"):
     url = "https://loginbp.ggpolarbear.com/MajorRegister"
@@ -348,24 +346,21 @@ def generate_random_password_suffix():
     chars = string.ascii_uppercase + string.digits
     return '_' + ''.join(random.choices(chars, k=4))
 
-def generate_random_name_suffix():
-    """Generate 5 random superscript digits for name suffix"""
-    superscript_digits = '¹²³⁴⁵⁶⁷⁸⁹⁰'
-    return ''.join(random.choices(superscript_digits, k=5))
+def format_custom_name(base_name):
+    """Formats name strictly up to max 12 chars using superscript digits"""
+    superscript_map = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+    rand_num = str(random.randint(1000, 9999)).translate(superscript_map)
+    suffix = f"_{rand_num}"
+    
+    max_base_len = 12 - len(suffix)
+    trimmed_base = base_name[:max_base_len] if max_base_len > 0 else base_name[:7]
+    return f"{trimmed_base}{suffix}"
 
 def check_name_taken_error(response):
-    """Check if the error indicates name is already taken"""
     if isinstance(response, dict):
         if 9 in response:
             error_msg = str(response[9]).lower()
-            name_taken_patterns = [
-                'already exists',
-                'already taken',
-                'duplicate',
-                'exists',
-                'taken',
-                'muddle'
-            ]
+            name_taken_patterns = ['already exists', 'already taken', 'duplicate', 'exists', 'taken', 'muddle']
             for pattern in name_taken_patterns:
                 if pattern in error_msg:
                     return True
@@ -377,25 +372,24 @@ def check_name_taken_error(response):
     return False
 
 def register_single_account(name, password, region="BD"):
-    """Generate a single account with retry logic"""
     max_retries = 10
     attempt = 0
     
     while attempt < max_retries:
         attempt += 1
         try:
-            final_password = password + generate_random_password_suffix()
+            # Custom Password Format: Sulav_{random}
+            final_password = f"{password}{generate_random_password_suffix()}"
             
+            # Register Garena Guest Account
             uid, _ = register_account(final_password, region)
             
             access_token, open_id, platform_type = get_access_token(uid, final_password, region)
             if access_token is None:
                 continue
             
-            if attempt == 1:
-                current_name = name
-            else:
-                current_name = name + generate_random_name_suffix()
+            # Custom Name Format: Max 12 Chars (e.g., Sulav_¹⁶⁷⁵)
+            current_name = format_custom_name(name)
             
             major_register_response = major_register(access_token, open_id, current_name, region=region)
             
@@ -419,19 +413,6 @@ def register_single_account(name, password, region="BD"):
                 if jwt_token and server_url:
                     login_data_response = get_login_data(server_url, jwt_token, payload, region)
                     region_result = login_data_response.get(3, region)
-                    
-                    if region_result != region.upper():
-                        if attempt < max_retries:
-                            continue
-                        else:
-                            return {
-                                "error": f"Region mismatch. Expected: {region.upper()}, Got: {region_result}",
-                                "uid": uid,
-                                "password": final_password,
-                                "name": current_name,
-                                "account_id": account_id,
-                                "region_got": region_result
-                            }
                     
                     return {
                         "success": True,
@@ -476,33 +457,23 @@ def register_single_account(name, password, region="BD"):
     return {"error": "Max retries reached"}
 
 def register_account_full(name, password, region="BD", count=1):
-    """Generate multiple accounts"""
-    count = min(max(count, 1), 10)  # Clamp between 1 and 10
+    count = min(max(count, 1), 10)
     
     results = []
     successful = 0
     failed = 0
     
     for i in range(count):
-        # Generate a unique name for each account
-        if count > 1:
-            # Add number suffix for multiple accounts
-            account_name = f"{name}_{i+1}"
-        else:
-            account_name = name
-        
-        result = register_single_account(account_name, password, region)
+        result = register_single_account(name, password, region)
         
         if result.get("success"):
             successful += 1
             results.append(result)
         else:
             failed += 1
-            # Still include failed attempts but mark them
             result["attempt"] = i + 1
             results.append(result)
         
-        # Small delay between accounts to avoid rate limiting
         if i < count - 1:
             time.sleep(0.5)
     
@@ -524,301 +495,39 @@ HTML_TEMPLATE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FF Account Generator</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: #0a0a0a;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-        .container {
-            background: linear-gradient(145deg, #1a1a2e, #16213e);
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.8), 0 0 40px rgba(100, 100, 255, 0.1);
-            padding: 40px;
-            max-width: 560px;
-            width: 100%;
-            border: 1px solid rgba(255,255,255,0.05);
-        }
-        h1 {
-            color: #fff;
-            font-size: 28px;
-            margin-bottom: 5px;
-            text-align: center;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            font-weight: 800;
-        }
-        .subtitle {
-            color: #888;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 13px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            color: #aaa;
-            font-weight: 600;
-            margin-bottom: 5px;
-            font-size: 13px;
-            letter-spacing: 0.5px;
-        }
-        input, select {
-            width: 100%;
-            padding: 12px 15px;
-            background: rgba(255,255,255,0.05);
-            border: 2px solid rgba(255,255,255,0.1);
-            border-radius: 10px;
-            font-size: 15px;
-            color: #fff;
-            transition: all 0.3s;
-        }
-        input::placeholder {
-            color: #555;
-        }
-        input:focus, select:focus {
-            outline: none;
-            border-color: #667eea;
-            background: rgba(255,255,255,0.08);
-            box-shadow: 0 0 20px rgba(102, 126, 234, 0.15);
-        }
-        select option {
-            background: #1a1a2e;
-            color: #fff;
-        }
-        .btn {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s;
-            letter-spacing: 0.5px;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
-        }
-        .btn:active {
-            transform: translateY(0);
-        }
-        .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        #result {
-            margin-top: 20px;
-            padding: 15px;
-            border-radius: 10px;
-            display: none;
-            word-wrap: break-word;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        #result::-webkit-scrollbar {
-            width: 6px;
-        }
-        #result::-webkit-scrollbar-track {
-            background: rgba(255,255,255,0.05);
-            border-radius: 10px;
-        }
-        #result::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 10px;
-        }
-        #result.success {
-            display: block;
-            background: rgba(0, 255, 100, 0.08);
-            border: 1px solid rgba(0, 255, 100, 0.2);
-            color: #7dffb3;
-        }
-        #result.error {
-            display: block;
-            background: rgba(255, 0, 0, 0.08);
-            border: 1px solid rgba(255, 0, 0, 0.2);
-            color: #ff6b6b;
-        }
-        #result.loading {
-            display: block;
-            background: rgba(102, 126, 234, 0.08);
-            border: 1px solid rgba(102, 126, 234, 0.2);
-            color: #a8b4ff;
-        }
-        .result-item {
-            margin: 8px 0;
-            font-size: 13px;
-            padding: 4px 0;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
-        }
-        .result-item strong {
-            color: #a8b4ff;
-            display: inline-block;
-            min-width: 100px;
-        }
-        .result-item .value {
-            color: #fff;
-            word-break: break-all;
-        }
-        .result-item .highlight {
-            color: #7dffb3;
-            font-weight: 600;
-        }
-        .account-box {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 10px;
-            padding: 12px;
-            margin: 10px 0;
-        }
-        .account-box .account-title {
-            color: #667eea;
-            font-weight: 700;
-            font-size: 14px;
-            margin-bottom: 8px;
-        }
-        .account-box .account-item {
-            font-size: 12px;
-            padding: 2px 0;
-            color: #ccc;
-        }
-        .account-box .account-item strong {
-            color: #888;
-            min-width: 80px;
-            display: inline-block;
-        }
-        .badge-success {
-            display: inline-block;
-            background: rgba(0, 255, 100, 0.15);
-            color: #7dffb3;
-            padding: 2px 10px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        .badge-failed {
-            display: inline-block;
-            background: rgba(255, 0, 0, 0.15);
-            color: #ff6b6b;
-            padding: 2px 10px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        .summary {
-            background: rgba(255,255,255,0.03);
-            border-radius: 10px;
-            padding: 12px;
-            margin-bottom: 15px;
-            text-align: center;
-        }
-        .summary span {
-            margin: 0 10px;
-        }
-        .endpoints {
-            margin-top: 25px;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255,255,255,0.05);
-        }
-        .endpoints h3 {
-            color: #666;
-            font-size: 12px;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .endpoint {
-            background: rgba(255,255,255,0.03);
-            padding: 8px 12px;
-            border-radius: 6px;
-            margin: 5px 0;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            color: #888;
-            border: 1px solid rgba(255,255,255,0.05);
-        }
-        .endpoint span {
-            color: #667eea;
-            font-weight: 600;
-        }
-        .dev-info {
-            margin-top: 20px;
-            padding-top: 15px;
-            border-top: 1px solid rgba(255,255,255,0.05);
-            text-align: center;
-            color: #555;
-            font-size: 12px;
-        }
-        .dev-info a {
-            color: #667eea;
-            text-decoration: none;
-            font-weight: 600;
-        }
-        .dev-info a:hover {
-            color: #764ba2;
-        }
-        .loading-spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(102, 126, 234, 0.2);
-            border-top: 3px solid #667eea;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-right: 10px;
-            vertical-align: middle;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        .copy-btn {
-            background: rgba(102, 126, 234, 0.2);
-            color: #667eea;
-            border: 1px solid rgba(102, 126, 234, 0.3);
-            padding: 2px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            margin-left: 5px;
-            transition: all 0.2s;
-        }
-        .copy-btn:hover {
-            background: rgba(102, 126, 234, 0.3);
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px; }
+        .container { background: linear-gradient(145deg, #1a1a2e, #16213e); border-radius: 20px; padding: 40px; max-width: 560px; width: 100%; border: 1px solid rgba(255,255,255,0.05); }
+        h1 { color: #fff; font-size: 28px; margin-bottom: 5px; text-align: center; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
+        .subtitle { color: #888; text-align: center; margin-bottom: 30px; font-size: 13px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #aaa; font-weight: 600; margin-bottom: 5px; font-size: 13px; }
+        input, select { width: 100%; padding: 12px 15px; background: rgba(255,255,255,0.05); border: 2px solid rgba(255,255,255,0.1); border-radius: 10px; font-size: 15px; color: #fff; }
+        select option { background: #1a1a2e; color: #fff; }
+        .btn { width: 100%; padding: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer; }
+        #result { margin-top: 20px; padding: 15px; border-radius: 10px; display: none; word-wrap: break-word; max-height: 500px; overflow-y: auto; }
+        #result.success { display: block; background: rgba(0, 255, 100, 0.08); border: 1px solid rgba(0, 255, 100, 0.2); color: #7dffb3; }
+        #result.error { display: block; background: rgba(255, 0, 0, 0.08); border: 1px solid rgba(255, 0, 0, 0.2); color: #ff6b6b; }
+        #result.loading { display: block; background: rgba(102, 126, 234, 0.08); border: 1px solid rgba(102, 126, 234, 0.2); color: #a8b4ff; }
+        .account-box { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px; margin: 10px 0; }
+        .account-box .account-title { color: #667eea; font-weight: 700; font-size: 14px; margin-bottom: 8px; }
+        .account-box .account-item { font-size: 12px; padding: 2px 0; color: #ccc; }
+        .account-box .account-item strong { color: #888; min-width: 80px; display: inline-block; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🎮 FF Generator</h1>
         <p class="subtitle">⚡ Generate Free Fire accounts instantly</p>
-        
         <form id="form">
             <div class="form-group">
                 <label>👤 Nickname</label>
-                <input type="text" id="name" placeholder="Enter your nickname" value="ALWAYS~MARUF" required>
+                <input type="text" id="name" placeholder="Enter nickname" value="Sulav" required>
             </div>
-            
             <div class="form-group">
                 <label>🔑 Password</label>
-                <input type="text" id="password" placeholder="Enter password" value="MARUF" required>
+                <input type="text" id="password" placeholder="Enter password" value="Sulav" required>
             </div>
-            
             <div class="form-group">
                 <label>🌍 Region</label>
                 <select id="region">
@@ -835,32 +544,17 @@ HTML_TEMPLATE = '''
                     <option value="TW">🇹🇼 Taiwan (TW)</option>
                 </select>
             </div>
-            
             <div class="form-group">
                 <label>📊 Count (1-10)</label>
                 <input type="number" id="count" min="1" max="10" value="1">
             </div>
-            
             <button type="submit" class="btn" id="submitBtn">🚀 Generate Account(s)</button>
         </form>
-        
         <div id="result"></div>
-        
-        <div class="endpoints">
-            <h3>📡 API Endpoints</h3>
-            <div class="endpoint"><span>GET</span> /gen?name=NAME&password=PASS&region=BD&count=1</div>
-            <div class="endpoint"><span>GET</span> /health</div>
-        </div>
-        
-        <div class="dev-info">
-            💻 Developer: <a href="https://t.me/FF_CLIENT" target="_blank">@FF_CLIENT</a>
-        </div>
     </div>
-
     <script>
         document.getElementById('form').addEventListener('submit', async function(e) {
             e.preventDefault();
-            
             const name = document.getElementById('name').value.trim();
             const password = document.getElementById('password').value.trim();
             const region = document.getElementById('region').value;
@@ -868,70 +562,32 @@ HTML_TEMPLATE = '''
             const resultDiv = document.getElementById('result');
             const submitBtn = document.getElementById('submitBtn');
             
-            if (!name || !password) {
-                resultDiv.className = 'error';
-                resultDiv.innerHTML = '❌ Please fill in all fields';
-                return;
-            }
-            
-            if (count < 1 || count > 10) {
-                resultDiv.className = 'error';
-                resultDiv.innerHTML = '❌ Count must be between 1 and 10';
-                return;
-            }
-            
-            // Show loading
             resultDiv.className = 'loading';
-            resultDiv.innerHTML = '<div class="loading-spinner"></div> Generating ' + count + ' account(s)...';
+            resultDiv.innerHTML = 'Generating ' + count + ' account(s)...';
             submitBtn.disabled = true;
             
             try {
                 const response = await fetch(`/gen?name=${encodeURIComponent(name)}&password=${encodeURIComponent(password)}&region=${encodeURIComponent(region)}&count=${count}`);
                 const data = await response.json();
                 
-                if (data.success && data.successful > 0) {
+                if (data.successful > 0) {
                     resultDiv.className = 'success';
-                    let html = '✅ <strong>Account Generation Complete!</strong><br><br>';
-                    html += `<div class="summary">`;
-                    html += `<span>📊 Total: <strong>${data.total}</strong></span>`;
-                    html += `<span>✅ Success: <strong style="color:#7dffb3;">${data.successful}</strong></span>`;
-                    html += `<span>❌ Failed: <strong style="color:#ff6b6b;">${data.failed}</strong></span>`;
-                    html += `</div>`;
-                    
+                    let html = '✅ <strong>Complete!</strong><br><br>';
                     data.accounts.forEach((acc, index) => {
                         if (acc.success) {
                             html += `<div class="account-box">`;
-                            html += `<div class="account-title">✅ Account #${index + 1} <span class="badge-success">Success</span></div>`;
+                            html += `<div class="account-title">Account #${index + 1}</div>`;
                             html += `<div class="account-item"><strong>UID:</strong> ${acc.uid}</div>`;
                             html += `<div class="account-item"><strong>Password:</strong> ${acc.password}</div>`;
                             html += `<div class="account-item"><strong>Name:</strong> ${acc.name}</div>`;
                             html += `<div class="account-item"><strong>Account ID:</strong> ${acc.account_id}</div>`;
-                            html += `<div class="account-item"><strong>Region:</strong> ${acc.region}</div>`;
-                            html += `</div>`;
-                        } else {
-                            html += `<div class="account-box" style="border-color:rgba(255,0,0,0.2);">`;
-                            html += `<div class="account-title" style="color:#ff6b6b;">❌ Account #${index + 1} <span class="badge-failed">Failed</span></div>`;
-                            html += `<div class="account-item"><strong>Error:</strong> ${acc.error || 'Unknown error'}</div>`;
-                            if (acc.uid) {
-                                html += `<div class="account-item"><strong>UID:</strong> ${acc.uid}</div>`;
-                            }
-                            if (acc.password) {
-                                html += `<div class="account-item"><strong>Password:</strong> ${acc.password}</div>`;
-                            }
                             html += `</div>`;
                         }
                     });
-                    
                     resultDiv.innerHTML = html;
                 } else {
                     resultDiv.className = 'error';
-                    let html = `❌ <strong>Error: ${data.error || 'Generation failed'}</strong><br><br>`;
-                    if (data.accounts) {
-                        data.accounts.forEach((acc, index) => {
-                            html += `<div class="result-item"><strong>Account #${index + 1}:</strong> ${acc.error || 'Unknown error'}</div>`;
-                        });
-                    }
-                    resultDiv.innerHTML = html;
+                    resultDiv.innerHTML = `❌ Error: ${data.accounts[0]?.error || 'Failed'}`;
                 }
             } catch (error) {
                 resultDiv.className = 'error';
@@ -940,20 +596,6 @@ HTML_TEMPLATE = '''
                 submitBtn.disabled = false;
             }
         });
-        
-        function copyText(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                alert('✅ Copied to clipboard!');
-            }).catch(() => {
-                const input = document.createElement('input');
-                input.value = text;
-                document.body.appendChild(input);
-                input.select();
-                document.execCommand('copy');
-                document.body.removeChild(input);
-                alert('✅ Copied to clipboard!');
-            });
-        }
     </script>
 </body>
 </html>
@@ -974,12 +616,6 @@ def generate_account():
     if not name or not password:
         return jsonify({"error": "Missing required parameters: name and password"}), 400
     
-    if region.upper() not in IPRotator.REGION_IP_CIDRS:
-        return jsonify({"error": f"Invalid region. Supported regions: {list(IPRotator.REGION_IP_CIDRS.keys())}"}), 400
-    
-    if count < 1 or count > 10:
-        return jsonify({"error": "Count must be between 1 and 10"}), 400
-    
     result = register_account_full(name, password, region, count)
     return jsonify(result)
 
@@ -987,6 +623,5 @@ def generate_account():
 def health_check():
     return jsonify({"status": "ok", "regions": list(IPRotator.REGION_IP_CIDRS.keys())})
 
-# ==================== RUN ====================
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
